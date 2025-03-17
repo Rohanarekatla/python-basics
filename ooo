@@ -1,0 +1,14 @@
+#!/bin/bash
+
+# Extract databases from terraform.tfvars
+DATABASES=$(grep 'v_all_databases_for_failovergroup' terraform.tfvars | awk -F'=' '{print $2}' | tr -d '[]"' | tr ',' '\n' | tr -d ' ')
+
+# Loop through each database
+for DB in $DATABASES; do
+  echo "Applying Terraform for database: $DB"
+  
+  # Run Terraform with a custom state file
+  terraform apply -auto-approve \
+    -var="v_all_databases_for_failovergroup=[\"$DB\"]" \
+    -state="${DB}_failover.tfstate"
+done
