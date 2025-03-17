@@ -6,13 +6,15 @@ PRIMARY_ACCOUNT=$(grep 'v_primaryaccount' terraform.tfvars | awk -F'=' '{print $
 # Extract databases from terraform.tfvars
 DATABASES=$(grep 'v_all_databases_for_failovergroup' terraform.tfvars | awk -F'=' '{print $2}' | tr -d '[]"' | tr ',' '\n' | tr -d ' ')
 
-# Step 1: Create the account-level failover group
+# ------------------------------------------------------------------------------
+# Step 1: Create the account-level failover group (only once)
+# ------------------------------------------------------------------------------
 echo "Creating account-level failover group for account: $PRIMARY_ACCOUNT..."
 
 # Remove any existing backend.tf file to avoid conflicts
 rm -f backend.tf
 
-# Create a new backend configuration file
+# Create a temporary backend configuration for the account-level group
 cat <<EOF > backend.tf
 terraform {
   backend "local" {
@@ -21,20 +23,20 @@ terraform {
 }
 EOF
 
-# Initialize Terraform (required to update the backend configuration)
+# Initialize and apply for the account-level group
 terraform init -reconfigure
+terraform apply -auto-approve -target=snowflake_failover_group.source_failover_group -target=snowflake_failover_group.target_failover_group
 
-# Apply Terraform configuration for the account-level failover group
-terraform apply -auto-approve -var="v_all_databases_for_failovergroup=[]"
-
-# Step 2: Create database-level failover groups for each database
+# ------------------------------------------------------------------------------
+# Step 2: Create database-level failover groups (isolated from account-level)
+# ------------------------------------------------------------------------------
 for DB in $DATABASES; do
   echo "Applying Terraform for database: $DB"
   
   # Remove any existing backend.tf file to avoid conflicts
   rm -f backend.tf
   
-  # Create a new backend configuration file
+  # Create a new backend configuration for the database
   cat <<EOF > backend.tf
 terraform {
   backend "local" {
@@ -43,12 +45,14 @@ terraform {
 }
 EOF
   
-  # Initialize Terraform (required to update the backend configuration)
+  # Initialize Terraform (fresh state for each database)
   terraform init -reconfigure
   
-  # Apply Terraform configuration for the database-level failover group
-  terraform apply -auto-approve -var="v_all_databases_for_failovergroup=[\"$DB\"]"
+  # Apply ONLY the database-level resources using -target
+  terraform apply -auto-approve \
+    -target=snowflake_failover_group.source_failover_database_group2[\"$DB\"] \
+    -target=snowflake_failover_group.target_failover_database_group2[\"$DB\"]
   
-  # Clean up the temporary backend configuration file
+  # Clean up the temporary backend configuration
   rm backend.tf
 done
