@@ -1,29 +1,53 @@
 #!/bin/bash
 
-# Extract the primary account name and databases
+# Extract primary account and databases from terraform.tfvars
 PRIMARY_ACCOUNT=$(grep 'v_primaryaccount' terraform.tfvars | awk -F'=' '{print $2}' | tr -d ' "')
 DATABASES=$(grep 'v_all_databases_for_failovergroup' terraform.tfvars | awk -F'=' '{print $2}' | tr -d '[]"' | tr ',' '\n' | tr -d ' ')
 
 # ------------------------------------------------------------------------------
-# Step 1: Initialize Terraform once (shared across all workspaces)
+# Step 1: Create account-level failover group (custom state file)
 # ------------------------------------------------------------------------------
-terraform init
+echo "Creating account-level failover group: ${PRIMARY_ACCOUNT}_failover.tfstate"
+cat <<EOF > backend.tf
+terraform {
+  backend "local" {
+    path = "${PRIMARY_ACCOUNT}_failover.tfstate"
+  }
+}
+EOF
 
-# ------------------------------------------------------------------------------
-# Step 2: Create account-level failover group in its own workspace
-# ------------------------------------------------------------------------------
-echo "Creating account-level failover group for account: $PRIMARY_ACCOUNT..."
-terraform workspace new account-level || terraform workspace select account-level
+# Initialize once and skip provider downloads if cached
+if [ ! -d ".terraform" ]; then
+  terraform init -input=false
+else
+  terraform init -reconfigure -input=false
+fi
+
 terraform apply -auto-approve -target=snowflake_failover_group.source_failover_group -target=snowflake_failover_group.target_failover_group
 
 # ------------------------------------------------------------------------------
-# Step 3: Create database-level failover groups in isolated workspaces
+# Step 2: Create database-level failover groups (custom state files)
 # ------------------------------------------------------------------------------
 for DB in $DATABASES; do
-  echo "Creating failover group for database: $DB"
-  terraform workspace new "$DB" || terraform workspace select "$DB"
-  terraform apply -auto-approve -target=snowflake_failover_group.source_failover_database_group2[\"$DB\"] -target=snowflake_failover_group.target_failover_database_group2[\"$DB\"]
+  echo "Creating database-level failover group: ${DB}_failover.tfstate"
+  
+  # Update backend configuration
+  cat <<EOF > backend.tf
+terraform {
+  backend "local" {
+    path = "${DB}_failover.tfstate"
+  }
+}
+EOF
+
+  # Reinitialize quickly (reuses cached providers)
+  terraform init -reconfigure -input=false
+  
+  # Apply only database-specific resources
+  terraform apply -auto-approve \
+    -target=snowflake_failover_group.source_failover_database_group2[\"$DB\"] \
+    -target=snowflake_failover_group.target_failover_database_group2[\"$DB\"]
 done
 
-# Reset to default workspace (optional)
-terraform workspace select default
+# Cleanup
+rm -f backend.tf
