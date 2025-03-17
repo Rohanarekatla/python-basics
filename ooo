@@ -8,6 +8,11 @@ DATABASES=$(grep 'v_all_databases_for_failovergroup' terraform.tfvars | awk -F'=
 
 # Step 1: Create the account-level failover group
 echo "Creating account-level failover group for account: $PRIMARY_ACCOUNT..."
+
+# Remove any existing backend.tf file to avoid conflicts
+rm -f backend.tf
+
+# Create a new backend configuration file
 cat <<EOF > backend.tf
 terraform {
   backend "local" {
@@ -26,7 +31,10 @@ terraform apply -auto-approve -var="v_all_databases_for_failovergroup=[]"
 for DB in $DATABASES; do
   echo "Applying Terraform for database: $DB"
   
-  # Create a temporary backend configuration file
+  # Remove any existing backend.tf file to avoid conflicts
+  rm -f backend.tf
+  
+  # Create a new backend configuration file
   cat <<EOF > backend.tf
 terraform {
   backend "local" {
