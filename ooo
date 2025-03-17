@@ -1,14 +1,46 @@
 #!/bin/bash
 
+# Extract the primary account name from terraform.tfvars
+PRIMARY_ACCOUNT=$(grep 'v_primaryaccount' terraform.tfvars | awk -F'=' '{print $2}' | tr -d ' "')
+
 # Extract databases from terraform.tfvars
 DATABASES=$(grep 'v_all_databases_for_failovergroup' terraform.tfvars | awk -F'=' '{print $2}' | tr -d '[]"' | tr ',' '\n' | tr -d ' ')
 
-# Loop through each database
+# Step 1: Create the account-level failover group
+echo "Creating account-level failover group for account: $PRIMARY_ACCOUNT..."
+cat <<EOF > backend.tf
+terraform {
+  backend "local" {
+    path = "${PRIMARY_ACCOUNT}_failover.tfstate"
+  }
+}
+EOF
+
+# Initialize Terraform (required to update the backend configuration)
+terraform init -reconfigure
+
+# Apply Terraform configuration for the account-level failover group
+terraform apply -auto-approve -var="v_all_databases_for_failovergroup=[]"
+
+# Step 2: Create database-level failover groups for each database
 for DB in $DATABASES; do
   echo "Applying Terraform for database: $DB"
   
-  # Run Terraform with a custom state file
-  terraform apply -auto-approve \
-    -var="v_all_databases_for_failovergroup=[\"$DB\"]" \
-    -state="${DB}_failover.tfstate"
+  # Create a temporary backend configuration file
+  cat <<EOF > backend.tf
+terraform {
+  backend "local" {
+    path = "${DB}_failover.tfstate"
+  }
+}
+EOF
+  
+  # Initialize Terraform (required to update the backend configuration)
+  terraform init -reconfigure
+  
+  # Apply Terraform configuration for the database-level failover group
+  terraform apply -auto-approve -var="v_all_databases_for_failovergroup=[\"$DB\"]"
+  
+  # Clean up the temporary backend configuration file
+  rm backend.tf
 done
