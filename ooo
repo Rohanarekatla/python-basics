@@ -2,24 +2,31 @@
 -- 1. Setup Test Environment
 -- ===================================================================
 USE ROLE USERADMIN;
+
+-- Create a role
 CREATE OR REPLACE ROLE priv_copy_test_role;
+
+-- Create a user and assign the role
 CREATE OR REPLACE USER priv_copy_test_user 
   PASSWORD = 'TestPass123' 
-  DEFAULT_ROLE = PUBLIC 
+  DEFAULT_ROLE = priv_copy_test_role 
   MUST_CHANGE_PASSWORD = FALSE;
+GRANT ROLE priv_copy_test_role TO USER priv_copy_test_user;
 
 USE ROLE SYSADMIN;
+
+-- Create a database and schemas
 CREATE OR REPLACE DATABASE priv_copy_db;
 CREATE SCHEMA priv_copy_db.source_schema;
 CREATE SCHEMA priv_copy_db.target_schema;
 
--- Grant privileges to test copying
+-- Grant necessary privileges to the role
+GRANT USAGE ON DATABASE priv_copy_db TO ROLE priv_copy_test_role;
 GRANT USAGE ON SCHEMA priv_copy_db.source_schema TO ROLE priv_copy_test_role;
-GRANT MONITOR ON SCHEMA priv_copy_db.source_schema TO ROLE PUBLIC;
-GRANT CREATE TABLE ON SCHEMA priv_copy_db.source_schema TO USER priv_copy_test_user WITH GRANT OPTION;
+GRANT CREATE TABLE ON SCHEMA priv_copy_db.source_schema TO ROLE priv_copy_test_role WITH GRANT OPTION;
 
 -- ===================================================================
--- 2. Fixed Stored Procedure for Copying Schema Privileges
+-- 2. Stored Procedure to Copy Schema Privileges
 -- ===================================================================
 CREATE OR REPLACE PROCEDURE COPY_SCHEMA_PRIVILEGES(
   source_schema STRING, 
@@ -35,29 +42,51 @@ DECLARE
   src_schema_name STRING DEFAULT SPLIT_PART(source_schema, '.', 2);
   tgt_db_name STRING DEFAULT SPLIT_PART(target_schema, '.', 1);
   tgt_schema_name STRING DEFAULT SPLIT_PART(target_schema, '.', 2);
-
+  
   c1 CURSOR FOR 
     SELECT 
-      privilege, 
-      grantee_name, 
-      grant_option 
-    FROM INFORMATION_SCHEMA.SCHEMA_PRIVILEGES 
-    WHERE table_catalog = src_db_name 
-      AND table_schema = src_schema_name 
-      AND privilege != 'OWNERSHIP';
+      p.privilege,
+      p.granted_on,
+      p.grantee_name,
+      p.grant_option,
+      p.granted_to
+    FROM TABLE(
+      INFORMATION_SCHEMA.OBJECT_PRIVILEGES(
+        OBJECT_TYPE => 'SCHEMA',
+        OBJECT_NAME => :src_schema_name,
+        DATABASE_NAME => :src_db_name
+      )
+    ) p
+    WHERE p.privilege != 'OWNERSHIP';
   
   sql_stmt STRING;
+  error_msg STRING;
 BEGIN
-  -- Iterate through each privilege and apply to target schema
   FOR rec IN c1 DO
+    -- Build grant statement with proper escaping
     sql_stmt := 'GRANT ' || rec.privilege || 
-                ' ON SCHEMA ' || tgt_db_name || '.' || tgt_schema_name || 
-                ' TO ROLE ' || rec.grantee_name || 
-                CASE WHEN rec.grant_option = 'YES' THEN ' WITH GRANT OPTION' ELSE '' END;
+               ' ON SCHEMA ' || :tgt_db_name || '.' || :tgt_schema_name ||
+               ' TO ' || 
+               CASE rec.granted_to
+                 WHEN 'ROLE' THEN 'ROLE "' || rec.grantee_name || '"'
+                 WHEN 'USER' THEN 'USER "' || rec.grantee_name || '"'
+                 ELSE 'INVALID_GRANTEE'
+               END ||
+               CASE WHEN rec.grant_option = 'YES' 
+                    THEN ' WITH GRANT OPTION' 
+                    ELSE '' 
+               END;
     
-    EXECUTE IMMEDIATE sql_stmt;
+    -- Execute with error handling
+    BEGIN
+      EXECUTE IMMEDIATE :sql_stmt;
+    EXCEPTION
+      WHEN OTHER THEN
+        error_msg := 'Error executing: ' || :sql_stmt || '\n' || SQLERRM;
+        RETURN error_msg;
+    END;
   END FOR;
-
+  
   RETURN 'Privileges copied successfully';
 END;
 $$;
@@ -65,31 +94,42 @@ $$;
 -- ===================================================================
 -- 3. Execute & Validate
 -- ===================================================================
+-- Execute the procedure to copy privileges
 CALL COPY_SCHEMA_PRIVILEGES(
   'priv_copy_db.source_schema', 
   'priv_copy_db.target_schema'
 );
 
--- Validation Query
+-- Validation query to compare privileges
 WITH source_grants AS (
   SELECT 
     privilege,
     grantee_name,
+    granted_to,
     grant_option
-  FROM INFORMATION_SCHEMA.SCHEMA_PRIVILEGES
-  WHERE table_catalog = 'priv_copy_db'
-    AND table_schema = 'source_schema'
-    AND privilege != 'OWNERSHIP'
+  FROM TABLE(
+    INFORMATION_SCHEMA.OBJECT_PRIVILEGES(
+      OBJECT_TYPE => 'SCHEMA',
+      OBJECT_NAME => 'source_schema',
+      DATABASE_NAME => 'priv_copy_db'
+    )
+  )
+  WHERE privilege != 'OWNERSHIP'
 ),
 target_grants AS (
   SELECT 
     privilege,
     grantee_name,
+    granted_to,
     grant_option
-  FROM INFORMATION_SCHEMA.SCHEMA_PRIVILEGES
-  WHERE table_catalog = 'priv_copy_db'
-    AND table_schema = 'target_schema'
-    AND privilege != 'OWNERSHIP'
+  FROM TABLE(
+    INFORMATION_SCHEMA.OBJECT_PRIVILEGES(
+      OBJECT_TYPE => 'SCHEMA',
+      OBJECT_NAME => 'target_schema',
+      DATABASE_NAME => 'priv_copy_db'
+    )
+  )
+  WHERE privilege != 'OWNERSHIP'
 )
 
 SELECT 
@@ -106,8 +146,8 @@ FROM target_grants;
 -- 4. Cleanup
 -- ===================================================================
 USE ROLE USERADMIN;
-DROP USER priv_copy_test_user;
-DROP ROLE priv_copy_test_role;
+DROP USER IF EXISTS priv_copy_test_user;
+DROP ROLE IF EXISTS priv_copy_test_role;
 
 USE ROLE SYSADMIN;
-DROP DATABASE priv_copy_db;
+DROP DATABASE IF EXISTS priv_copy_db;
