@@ -1,0 +1,89 @@
+-- =============================================
+-- 1. Setup Test Environment
+-- =============================================
+USE ROLE ACCOUNTADMIN;
+
+-- Create test database
+CREATE OR REPLACE DATABASE SP_TEST_DB;
+USE DATABASE SP_TEST_DB;
+
+-- Create original schema and restore schema (using CLONE for testing)
+CREATE OR REPLACE SCHEMA ORIGINAL_SCHEMA;
+CREATE OR REPLACE SCHEMA RESTORED_SCHEMA CLONE ORIGINAL_SCHEMA;
+
+-- Create test roles
+CREATE OR REPLACE ROLE TEST_ROLE_1;
+CREATE OR REPLACE ROLE TEST_ROLE_2;
+CREATE OR REPLACE USER TEST_USER 
+  PASSWORD = 'TestPassword123' 
+  DEFAULT_ROLE = PUBLIC;
+
+-- Grant privileges on original schema
+GRANT USAGE ON SCHEMA ORIGINAL_SCHEMA TO ROLE TEST_ROLE_1;
+GRANT CREATE TABLE ON SCHEMA ORIGINAL_SCHEMA TO ROLE TEST_ROLE_2;
+GRANT MODIFY ON SCHEMA ORIGINAL_SCHEMA TO USER TEST_USER WITH GRANT OPTION;
+GRANT USAGE, MONITOR ON SCHEMA ORIGINAL_SCHEMA TO PUBLIC;
+
+-- =============================================
+-- 2. Create Stored Procedure (Improved Version)
+-- =============================================
+CREATE OR REPLACE PROCEDURE COPY_SCHEMA_PRIVILEGES(
+    original_schema STRING,
+    restored_schema STRING
+)
+RETURNS STRING
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS
+$$
+DECLARE
+    c1 CURSOR FOR 
+        SELECT * 
+        FROM TABLE(
+            INFORMATION_SCHEMA.OBJECT_PRIVILEGES(
+                OBJECT_TYPE => 'SCHEMA',
+                OBJECT_NAME => :original_schema
+            )
+        )
+        WHERE PRIVILEGE != 'OWNERSHIP';
+    
+    grant_sql STRING;
+    row VARIANT;
+BEGIN
+    FOR row IN c1 DO
+        grant_sql := 'GRANT ' || row.PRIVILEGE || ' ON SCHEMA ' || :restored_schema ||
+                    ' TO ' || row.GRANTEE_TYPE || ' ' || row.GRANTEE || 
+                    IFF(row.IS_GRANTABLE = 'YES', ' WITH GRANT OPTION', '');
+        
+        EXECUTE IMMEDIATE :grant_sql;
+    END FOR;
+    
+    RETURN 'Privileges copied successfully from ' || :original_schema || ' to ' || :restored_schema;
+EXCEPTION
+    WHEN OTHER THEN
+        RETURN 'Error: ' || SQLERRM;
+END;
+$$;
+
+-- =============================================
+-- 3. Execute Tests
+-- =============================================
+-- Show original grants
+SHOW GRANTS ON SCHEMA ORIGINAL_SCHEMA;
+
+-- Execute the SP
+CALL COPY_SCHEMA_PRIVILEGES('SP_TEST_DB.ORIGINAL_SCHEMA', 'SP_TEST_DB.RESTORED_SCHEMA');
+
+-- Show restored schema grants
+SHOW GRANTS ON SCHEMA RESTORED_SCHEMA;
+
+-- =============================================
+-- 4. Cleanup (Optional)
+-- =============================================
+/*
+USE ROLE ACCOUNTADMIN;
+DROP DATABASE SP_TEST_DB;
+DROP USER TEST_USER;
+DROP ROLE TEST_ROLE_1;
+DROP ROLE TEST_ROLE_2;
+*/
