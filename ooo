@@ -1,98 +1,147 @@
 -- =============================================
--- Corrected Test Environment Setup
+-- 1. Setup Test Environment
 -- =============================================
-USE ROLE ACCOUNTADMIN;
+USE ROLE SECURITYADMIN;
 
 -- Create test database
-CREATE OR REPLACE DATABASE SP_TEST_DB;
-USE DATABASE SP_TEST_DB;
+CREATE OR REPLACE DATABASE PRIVILEGE_COPY_DB;
+USE DATABASE PRIVILEGE_COPY_DB;
 
--- Create schemas
-CREATE OR REPLACE SCHEMA ORIGINAL_SCHEMA;
-CREATE OR REPLACE SCHEMA RESTORED_SCHEMA CLONE ORIGINAL_SCHEMA;
+-- Create source and target schemas
+CREATE OR REPLACE SCHEMA SOURCE_SCHEMA;
+CREATE OR REPLACE SCHEMA TARGET_SCHEMA;
 
--- Create test roles and user
-CREATE OR REPLACE ROLE TEST_ROLE_1;
-CREATE OR REPLACE ROLE TEST_ROLE_2;
+-- Create test roles
+CREATE OR REPLACE ROLE DATA_ENGINEER;
+CREATE OR REPLACE ROLE DATA_SCIENTIST;
+
+-- Create test user
 CREATE OR REPLACE USER TEST_USER 
-  PASSWORD = 'TestPassword123' 
-  DEFAULT_ROLE = PUBLIC;
+  PASSWORD = 'S3cur3P@ss!'
+  DEFAULT_ROLE = PUBLIC
+  MUST_CHANGE_PASSWORD = FALSE;
 
--- Grant database access to roles and user
-GRANT USAGE ON DATABASE SP_TEST_DB TO ROLE TEST_ROLE_1;
-GRANT USAGE ON DATABASE SP_TEST_DB TO ROLE TEST_ROLE_2;
-GRANT USAGE ON DATABASE SP_TEST_DB TO TEST_USER;
-
--- Grant schema privileges to roles
-GRANT USAGE ON SCHEMA SP_TEST_DB.ORIGINAL_SCHEMA TO ROLE TEST_ROLE_1;
-GRANT CREATE TABLE ON SCHEMA SP_TEST_DB.ORIGINAL_SCHEMA TO ROLE TEST_ROLE_2;
-GRANT USAGE ON SCHEMA SP_TEST_DB.ORIGINAL_SCHEMA TO ROLE PUBLIC;
-
--- Individual privileges to user - separate statements for each privilege
-GRANT MONITOR ON SCHEMA SP_TEST_DB.ORIGINAL_SCHEMA TO TEST_USER;
-GRANT CREATE EXTERNAL TABLE ON SCHEMA SP_TEST_DB.ORIGINAL_SCHEMA TO TEST_USER;
+-- Grant valid schema privileges (as per Snowflake docs)
+GRANT USAGE ON SCHEMA SOURCE_SCHEMA TO ROLE DATA_ENGINEER;
+GRANT MONITOR ON SCHEMA SOURCE_SCHEMA TO ROLE DATA_SCIENTIST;
+GRANT CREATE TABLE ON SCHEMA SOURCE_SCHEMA TO USER TEST_USER WITH GRANT OPTION;
 
 -- =============================================
--- Corrected Stored Procedure
+-- 2. Privilege Copy Procedure (Official Syntax)
 -- =============================================
-CREATE OR REPLACE PROCEDURE COPY_SCHEMA_PRIVILEGES(
-    original_schema STRING,
-    restored_schema STRING
+CREATE OR REPLACE PROCEDURE CLONE_SCHEMA_PRIVILEGES(
+  source_schema_name STRING,
+  target_schema_name STRING
 )
 RETURNS STRING
 LANGUAGE SQL
-EXECUTE AS CALLER
+EXECUTE AS CALLER -- Follows Snowflake's security best practices
 AS
 $$
 DECLARE
-    v_database STRING DEFAULT SPLIT_PART(:original_schema, '.', 1);
-    v_schema STRING DEFAULT SPLIT_PART(:original_schema, '.', 2);
-    
-    c1 CURSOR FOR 
-        SELECT *
-        FROM TABLE(
-            INFORMATION_SCHEMA.OBJECT_PRIVILEGES(
-                OBJECT_TYPE => 'SCHEMA',
-                OBJECT_NAME => :v_schema,
-                DATABASE_NAME => :v_database
-            )
-        )
-        WHERE PRIVILEGE != 'OWNERSHIP';
-    
-    grant_sql STRING;
-    row VARIANT;
+  src_db STRING DEFAULT SPLIT_PART(source_schema_name, '.', 1);
+  src_schema STRING DEFAULT SPLIT_PART(source_schema_name, '.', 2);
+  tgt_db STRING DEFAULT SPLIT_PART(target_schema_name, '.', 1);
+  tgt_schema STRING DEFAULT SPLIT_PART(target_schema_name, '.', 2);
+  
+  c1 CURSOR FOR 
+    SELECT 
+      privilege,
+      grantee_name,
+      grantee_type,
+      grant_option
+    FROM TABLE(
+      INFORMATION_SCHEMA.OBJECT_PRIVILEGES(
+        OBJECT_TYPE => 'SCHEMA',
+        OBJECT_NAME => :src_schema,
+        DATABASE_NAME => :src_db
+      )
+    )
+    WHERE privilege != 'OWNERSHIP';
+  
+  sql_stmt STRING;
 BEGIN
-    FOR row IN c1 DO
-        grant_sql := 'GRANT ' || row.PRIVILEGE || 
-                    ' ON SCHEMA ' || :restored_schema ||
-                    ' TO ' || 
-                    CASE 
-                        WHEN row.GRANTEE_TYPE = 'ROLE' THEN 'ROLE ' || row.GRANTEE
-                        ELSE row.GRANTEE
-                    END;
-        
-        EXECUTE IMMEDIATE :grant_sql;
-    END FOR;
+  FOR record IN c1 DO
+    -- Build grant statement with proper escaping
+    sql_stmt := 'GRANT ' || record.privilege || 
+               ' ON SCHEMA ' || :tgt_db || '.' || :tgt_schema ||
+               ' TO ' || 
+               CASE record.grantee_type
+                 WHEN 'ROLE' THEN 'ROLE "' || record.grantee_name || '"'
+                 WHEN 'USER' THEN 'USER "' || record.grantee_name || '"'
+                 ELSE 'INVALID_GRANTEE'
+               END ||
+               CASE WHEN record.grant_option = 'YES' 
+                    THEN ' WITH GRANT OPTION' 
+                    ELSE '' 
+               END;
     
-    RETURN 'Privileges copied successfully from ' || :original_schema || 
-           ' to ' || :restored_schema;
-EXCEPTION
-    WHEN OTHER THEN
-        RETURN 'Error: ' || SQLERRM;
+    -- Validate before execution
+    IF record.grantee_type NOT IN ('ROLE', 'USER') THEN
+      CONTINUE;
+    END IF;
+    
+    -- Execute with error handling
+    BEGIN
+      EXECUTE IMMEDIATE :sql_stmt;
+    EXCEPTION
+      WHEN OTHER THEN
+        RETURN 'Failed: ' || :sql_stmt || ' | Error: ' || SQLERRM;
+    END;
+  END FOR;
+  
+  RETURN 'Successfully cloned privileges from ' || :source_schema_name || 
+         ' to ' || :target_schema_name;
 END;
 $$;
 
 -- =============================================
--- Execution & Validation
+-- 3. Execution & Validation
 -- =============================================
--- Show original grants
-SHOW GRANTS ON SCHEMA SP_TEST_DB.ORIGINAL_SCHEMA;
-
--- Execute the procedure
-CALL COPY_SCHEMA_PRIVILEGES(
-    'SP_TEST_DB.ORIGINAL_SCHEMA', 
-    'SP_TEST_DB.RESTORED_SCHEMA'
+-- Execute with fully qualified names
+CALL CLONE_SCHEMA_PRIVILEGES(
+  'PRIVILEGE_COPY_DB.SOURCE_SCHEMA',
+  'PRIVILEGE_COPY_DB.TARGET_SCHEMA'
 );
 
--- Show copied grants
-SHOW GRANTS ON SCHEMA SP_TEST_DB.RESTORED_SCHEMA;
+-- Verify results
+SELECT 
+  'SOURCE' AS schema_type,
+  privilege,
+  grantee_type,
+  grantee_name,
+  grant_option
+FROM TABLE(
+  INFORMATION_SCHEMA.OBJECT_PRIVILEGES(
+    OBJECT_TYPE => 'SCHEMA',
+    OBJECT_NAME => 'SOURCE_SCHEMA'
+  )
+)
+WHERE privilege != 'OWNERSHIP'
+
+UNION ALL
+
+SELECT 
+  'TARGET' AS schema_type,
+  privilege,
+  grantee_type,
+  grantee_name,
+  grant_option
+FROM TABLE(
+  INFORMATION_SCHEMA.OBJECT_PRIVILEGES(
+    OBJECT_TYPE => 'SCHEMA',
+    OBJECT_NAME => 'TARGET_SCHEMA'
+  )
+)
+ORDER BY 1, 2, 3;
+
+-- =============================================
+-- 4. Cleanup
+-- =============================================
+USE ROLE SECURITYADMIN;
+
+DROP PROCEDURE CLONE_SCHEMA_PRIVILEGES(STRING, STRING);
+DROP USER TEST_USER;
+DROP ROLE DATA_ENGINEER;
+DROP ROLE DATA_SCIENTIST;
+DROP DATABASE PRIVILEGE_COPY_DB;
