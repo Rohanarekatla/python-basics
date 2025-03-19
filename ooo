@@ -28,9 +28,9 @@ GRANT USAGE ON SCHEMA SP_TEST_DB.ORIGINAL_SCHEMA TO ROLE TEST_ROLE_1;
 GRANT CREATE TABLE ON SCHEMA SP_TEST_DB.ORIGINAL_SCHEMA TO ROLE TEST_ROLE_2;
 GRANT USAGE ON SCHEMA SP_TEST_DB.ORIGINAL_SCHEMA TO ROLE PUBLIC;
 
--- Grant schema privileges to user (correct syntax)
-GRANT MONITOR ON SCHEMA SP_TEST_DB.ORIGINAL_SCHEMA TO TEST_USER WITH GRANT OPTION;
-GRANT CREATE EXTERNAL TABLE ON SCHEMA SP_TEST_DB.ORIGINAL_SCHEMA TO TEST_USER WITH GRANT OPTION;
+-- Individual privileges to user - separate statements for each privilege
+GRANT MONITOR ON SCHEMA SP_TEST_DB.ORIGINAL_SCHEMA TO TEST_USER;
+GRANT CREATE EXTERNAL TABLE ON SCHEMA SP_TEST_DB.ORIGINAL_SCHEMA TO TEST_USER;
 
 -- =============================================
 -- Corrected Stored Procedure
@@ -68,10 +68,8 @@ BEGIN
                     ' TO ' || 
                     CASE 
                         WHEN row.GRANTEE_TYPE = 'ROLE' THEN 'ROLE ' || row.GRANTEE
-                        WHEN row.GRANTEE_TYPE = 'USER' THEN row.GRANTEE
-                        ELSE row.GRANTEE_TYPE || ' ' || row.GRANTEE
-                    END ||
-                    IFF(row.IS_GRANTABLE = 'YES', ' WITH GRANT OPTION', '');
+                        ELSE row.GRANTEE
+                    END;
         
         EXECUTE IMMEDIATE :grant_sql;
     END FOR;
