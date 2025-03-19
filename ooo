@@ -1,5 +1,5 @@
 -- =============================================
--- 1. Setup Test Environment
+-- Corrected Test Environment Setup
 -- =============================================
 USE ROLE ACCOUNTADMIN;
 
@@ -7,25 +7,28 @@ USE ROLE ACCOUNTADMIN;
 CREATE OR REPLACE DATABASE SP_TEST_DB;
 USE DATABASE SP_TEST_DB;
 
--- Create original schema and restore schema (using CLONE for testing)
+-- Create schemas
 CREATE OR REPLACE SCHEMA ORIGINAL_SCHEMA;
 CREATE OR REPLACE SCHEMA RESTORED_SCHEMA CLONE ORIGINAL_SCHEMA;
 
--- Create test roles
+-- Create test roles and user
 CREATE OR REPLACE ROLE TEST_ROLE_1;
 CREATE OR REPLACE ROLE TEST_ROLE_2;
 CREATE OR REPLACE USER TEST_USER 
   PASSWORD = 'TestPassword123' 
   DEFAULT_ROLE = PUBLIC;
 
--- Grant privileges on original schema
+-- Grant privileges to roles
 GRANT USAGE ON SCHEMA ORIGINAL_SCHEMA TO ROLE TEST_ROLE_1;
 GRANT CREATE TABLE ON SCHEMA ORIGINAL_SCHEMA TO ROLE TEST_ROLE_2;
-GRANT MODIFY ON SCHEMA ORIGINAL_SCHEMA TO USER TEST_USER WITH GRANT OPTION;
-GRANT USAGE, MONITOR ON SCHEMA ORIGINAL_SCHEMA TO PUBLIC;
+GRANT USAGE ON SCHEMA ORIGINAL_SCHEMA TO ROLE PUBLIC;
+
+-- Grant privileges to user with identifier
+GRANT MONITOR ON SCHEMA ORIGINAL_SCHEMA TO IDENTIFIER('"TEST_USER"') WITH GRANT OPTION;
+GRANT CREATE EXTERNAL TABLE ON SCHEMA ORIGINAL_SCHEMA TO IDENTIFIER('"TEST_USER"') WITH GRANT OPTION;
 
 -- =============================================
--- 2. Create Stored Procedure (Improved Version)
+-- Corrected Stored Procedure
 -- =============================================
 CREATE OR REPLACE PROCEDURE COPY_SCHEMA_PRIVILEGES(
     original_schema STRING,
@@ -37,12 +40,16 @@ EXECUTE AS CALLER
 AS
 $$
 DECLARE
+    v_database STRING DEFAULT SPLIT_PART(:original_schema, '.', 1);
+    v_schema STRING DEFAULT SPLIT_PART(:original_schema, '.', 2);
+    
     c1 CURSOR FOR 
-        SELECT * 
+        SELECT *
         FROM TABLE(
             INFORMATION_SCHEMA.OBJECT_PRIVILEGES(
                 OBJECT_TYPE => 'SCHEMA',
-                OBJECT_NAME => :original_schema
+                OBJECT_NAME => :v_schema,
+                DATABASE_NAME => :v_database
             )
         )
         WHERE PRIVILEGE != 'OWNERSHIP';
@@ -51,14 +58,21 @@ DECLARE
     row VARIANT;
 BEGIN
     FOR row IN c1 DO
-        grant_sql := 'GRANT ' || row.PRIVILEGE || ' ON SCHEMA ' || :restored_schema ||
-                    ' TO ' || row.GRANTEE_TYPE || ' ' || row.GRANTEE || 
+        grant_sql := 'GRANT ' || row.PRIVILEGE || 
+                    ' ON SCHEMA ' || :restored_schema ||
+                    ' TO ' || 
+                    CASE 
+                        WHEN row.GRANTEE_TYPE = 'ROLE' THEN 'ROLE ' || row.GRANTEE
+                        WHEN row.GRANTEE_TYPE = 'USER' THEN 'IDENTIFIER(''''' || row.GRANTEE || ''''')'
+                        ELSE row.GRANTEE_TYPE || ' ' || row.GRANTEE
+                    END ||
                     IFF(row.IS_GRANTABLE = 'YES', ' WITH GRANT OPTION', '');
         
         EXECUTE IMMEDIATE :grant_sql;
     END FOR;
     
-    RETURN 'Privileges copied successfully from ' || :original_schema || ' to ' || :restored_schema;
+    RETURN 'Privileges copied successfully from ' || :original_schema || 
+           ' to ' || :restored_schema;
 EXCEPTION
     WHEN OTHER THEN
         RETURN 'Error: ' || SQLERRM;
@@ -66,24 +80,16 @@ END;
 $$;
 
 -- =============================================
--- 3. Execute Tests
+-- Execution & Validation
 -- =============================================
 -- Show original grants
-SHOW GRANTS ON SCHEMA ORIGINAL_SCHEMA;
+SHOW GRANTS ON SCHEMA SP_TEST_DB.ORIGINAL_SCHEMA;
 
--- Execute the SP
-CALL COPY_SCHEMA_PRIVILEGES('SP_TEST_DB.ORIGINAL_SCHEMA', 'SP_TEST_DB.RESTORED_SCHEMA');
+-- Execute the procedure
+CALL COPY_SCHEMA_PRIVILEGES(
+    'SP_TEST_DB.ORIGINAL_SCHEMA', 
+    'SP_TEST_DB.RESTORED_SCHEMA'
+);
 
--- Show restored schema grants
-SHOW GRANTS ON SCHEMA RESTORED_SCHEMA;
-
--- =============================================
--- 4. Cleanup (Optional)
--- =============================================
-/*
-USE ROLE ACCOUNTADMIN;
-DROP DATABASE SP_TEST_DB;
-DROP USER TEST_USER;
-DROP ROLE TEST_ROLE_1;
-DROP ROLE TEST_ROLE_2;
-*/
+-- Show copied grants
+SHOW GRANTS ON SCHEMA SP_TEST_DB.RESTORED_SCHEMA;
