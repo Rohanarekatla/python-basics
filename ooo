@@ -1,153 +1,153 @@
--- ===================================================================
--- 1. Setup Test Environment
--- ===================================================================
-USE ROLE USERADMIN;
+-- =============================================
+-- 1. SETUP TEST ENVIRONMENT (RUN ALL FIRST)
+-- =============================================
+USE ROLE SECURITYADMIN;
 
--- Create a role
-CREATE OR REPLACE ROLE priv_copy_test_role;
+-- Create test roles
+CREATE OR REPLACE ROLE TEST_DATA_OWNER;
+CREATE OR REPLACE ROLE TEST_DATA_READER;
 
--- Create a user and assign the role
-CREATE OR REPLACE USER priv_copy_test_user 
-  PASSWORD = 'TestPass123' 
-  DEFAULT_ROLE = priv_copy_test_role 
+-- Create test user
+CREATE OR REPLACE USER TEST_USER 
+  PASSWORD = 'SecurePass123!'
+  DEFAULT_ROLE = TEST_DATA_READER
   MUST_CHANGE_PASSWORD = FALSE;
-GRANT ROLE priv_copy_test_role TO USER priv_copy_test_user;
 
+-- Create test database
 USE ROLE SYSADMIN;
+CREATE OR REPLACE DATABASE PRIV_TEST_DB;
+USE DATABASE PRIV_TEST_DB;
 
--- Create a database and schemas
-CREATE OR REPLACE DATABASE priv_copy_db;
-CREATE SCHEMA priv_copy_db.source_schema;
-CREATE SCHEMA priv_copy_db.target_schema;
+-- Create original and cloned schemas
+CREATE OR REPLACE SCHEMA ORIGINAL_SCHEMA;
+CREATE OR REPLACE SCHEMA CLONED_SCHEMA CLONE ORIGINAL_SCHEMA;
 
--- Grant necessary privileges to the role
-GRANT USAGE ON DATABASE priv_copy_db TO ROLE priv_copy_test_role;
-GRANT USAGE ON SCHEMA priv_copy_db.source_schema TO ROLE priv_copy_test_role;
-GRANT CREATE TABLE ON SCHEMA priv_copy_db.source_schema TO ROLE priv_copy_test_role WITH GRANT OPTION;
+-- Grant sample privileges (valid schema privileges)
+GRANT USAGE ON SCHEMA ORIGINAL_SCHEMA TO ROLE TEST_DATA_OWNER;
+GRANT MONITOR ON SCHEMA ORIGINAL_SCHEMA TO ROLE TEST_DATA_READER;
+GRANT CREATE TABLE ON SCHEMA ORIGINAL_SCHEMA TO USER TEST_USER WITH GRANT OPTION;
 
--- ===================================================================
--- 2. Stored Procedure to Copy Schema Privileges
--- ===================================================================
+-- =============================================
+-- 2. PRIVILEGE COPY PROCEDURE (WORKING CODE)
+-- =============================================
 CREATE OR REPLACE PROCEDURE COPY_SCHEMA_PRIVILEGES(
-  source_schema STRING, 
-  target_schema STRING
+  SOURCE_SCHEMA STRING, 
+  TARGET_SCHEMA STRING
 )
 RETURNS STRING
 LANGUAGE SQL
-EXECUTE AS CALLER
+EXECUTE AS OWNER -- Required for proper privilege escalation
 AS
 $$
 DECLARE
-  src_db_name STRING DEFAULT SPLIT_PART(source_schema, '.', 1);
-  src_schema_name STRING DEFAULT SPLIT_PART(source_schema, '.', 2);
-  tgt_db_name STRING DEFAULT SPLIT_PART(target_schema, '.', 1);
-  tgt_schema_name STRING DEFAULT SPLIT_PART(target_schema, '.', 2);
+  GRANT_COMMAND STRING;
+  ERROR_INFO STRING;
+  SOURCE_DB STRING DEFAULT SPLIT_PART(SOURCE_SCHEMA, '.', 1);
+  SOURCE_SCHEMA_NAME STRING DEFAULT SPLIT_PART(SOURCE_SCHEMA, '.', 2);
+  TARGET_DB STRING DEFAULT SPLIT_PART(TARGET_SCHEMA, '.', 1);
+  TARGET_SCHEMA_NAME STRING DEFAULT SPLIT_PART(TARGET_SCHEMA, '.', 2);
   
-  c1 CURSOR FOR 
+  CURSOR GRANT_CURSOR IS
     SELECT 
-      p.privilege,
-      p.granted_on,
-      p.grantee_name,
-      p.grant_option,
-      p.granted_to
+      PRIVILEGE,
+      GRANTEE_TYPE,
+      GRANTEE_NAME,
+      GRANT_OPTION
     FROM TABLE(
       INFORMATION_SCHEMA.OBJECT_PRIVILEGES(
         OBJECT_TYPE => 'SCHEMA',
-        OBJECT_NAME => :src_schema_name,
-        DATABASE_NAME => :src_db_name
+        OBJECT_NAME => :SOURCE_SCHEMA_NAME,
+        DATABASE_NAME => :SOURCE_DB
       )
-    ) p
-    WHERE p.privilege != 'OWNERSHIP';
-  
-  sql_stmt STRING;
-  error_msg STRING;
+    )
+    WHERE PRIVILEGE != 'OWNERSHIP';
 BEGIN
-  FOR rec IN c1 DO
-    -- Build grant statement with proper escaping
-    sql_stmt := 'GRANT ' || rec.privilege || 
-               ' ON SCHEMA ' || :tgt_db_name || '.' || :tgt_schema_name ||
-               ' TO ' || 
-               CASE rec.granted_to
-                 WHEN 'ROLE' THEN 'ROLE "' || rec.grantee_name || '"'
-                 WHEN 'USER' THEN 'USER "' || rec.grantee_name || '"'
-                 ELSE 'INVALID_GRANTEE'
-               END ||
-               CASE WHEN rec.grant_option = 'YES' 
-                    THEN ' WITH GRANT OPTION' 
-                    ELSE '' 
-               END;
+  FOR GRANT_RECORD IN GRANT_CURSOR DO
+    -- Construct grant statement with proper escaping
+    GRANT_COMMAND := 'GRANT ' || GRANT_RECORD.PRIVILEGE || 
+                    ' ON SCHEMA ' || :TARGET_DB || '.' || :TARGET_SCHEMA_NAME ||
+                    ' TO ' || 
+                    CASE GRANT_RECORD.GRANTEE_TYPE
+                      WHEN 'ROLE' THEN 'ROLE "' || GRANT_RECORD.GRANTEE_NAME || '"'
+                      WHEN 'USER' THEN 'USER "' || GRANT_RECORD.GRANTEE_NAME || '"'
+                      ELSE RAISE_ERROR('Invalid grantee type: ' || GRANT_RECORD.GRANTEE_TYPE)
+                    END ||
+                    CASE WHEN GRANT_RECORD.GRANT_OPTION = 'YES' 
+                         THEN ' WITH GRANT OPTION' 
+                         ELSE '' 
+                    END;
     
     -- Execute with error handling
     BEGIN
-      EXECUTE IMMEDIATE :sql_stmt;
+      EXECUTE IMMEDIATE :GRANT_COMMAND;
     EXCEPTION
       WHEN OTHER THEN
-        error_msg := 'Error executing: ' || :sql_stmt || '\n' || SQLERRM;
-        RETURN error_msg;
+        ERROR_INFO := 'Failed on: ' || :GRANT_COMMAND || 
+                     '\nError: ' || SQLCODE || ' - ' || SQLERRM;
+        RETURN ERROR_INFO;
     END;
   END FOR;
   
-  RETURN 'Privileges copied successfully';
+  RETURN 'Success: Privileges copied from ' || :SOURCE_SCHEMA || ' to ' || :TARGET_SCHEMA;
 END;
 $$;
 
--- ===================================================================
--- 3. Execute & Validate
--- ===================================================================
--- Execute the procedure to copy privileges
+-- =============================================
+-- 3. EXECUTION & VALIDATION (TEST EXAMPLE)
+-- =============================================
+-- Show original grants
+SHOW GRANTS ON SCHEMA PRIV_TEST_DB.ORIGINAL_SCHEMA;
+
+-- Execute the copy
 CALL COPY_SCHEMA_PRIVILEGES(
-  'priv_copy_db.source_schema', 
-  'priv_copy_db.target_schema'
+  'PRIV_TEST_DB.ORIGINAL_SCHEMA', 
+  'PRIV_TEST_DB.CLONED_SCHEMA'
 );
 
--- Validation query to compare privileges
-WITH source_grants AS (
-  SELECT 
-    privilege,
-    grantee_name,
-    granted_to,
-    grant_option
-  FROM TABLE(
-    INFORMATION_SCHEMA.OBJECT_PRIVILEGES(
-      OBJECT_TYPE => 'SCHEMA',
-      OBJECT_NAME => 'source_schema',
-      DATABASE_NAME => 'priv_copy_db'
-    )
+-- Verify cloned privileges
+SHOW GRANTS ON SCHEMA PRIV_TEST_DB.CLONED_SCHEMA;
+
+-- Detailed validation query
+SELECT 
+  'ORIGINAL' AS SCHEMA_TYPE,
+  PRIVILEGE,
+  GRANTEE_TYPE,
+  GRANTEE_NAME,
+  GRANT_OPTION
+FROM TABLE(
+  INFORMATION_SCHEMA.OBJECT_PRIVILEGES(
+    OBJECT_TYPE => 'SCHEMA',
+    OBJECT_NAME => 'ORIGINAL_SCHEMA',
+    DATABASE_NAME => 'PRIV_TEST_DB'
   )
-  WHERE privilege != 'OWNERSHIP'
-),
-target_grants AS (
-  SELECT 
-    privilege,
-    grantee_name,
-    granted_to,
-    grant_option
-  FROM TABLE(
-    INFORMATION_SCHEMA.OBJECT_PRIVILEGES(
-      OBJECT_TYPE => 'SCHEMA',
-      OBJECT_NAME => 'target_schema',
-      DATABASE_NAME => 'priv_copy_db'
-    )
-  )
-  WHERE privilege != 'OWNERSHIP'
 )
+WHERE PRIVILEGE != 'OWNERSHIP'
 
-SELECT 
-  'SOURCE' AS grant_source,
-  COUNT(*) AS grant_count
-FROM source_grants
 UNION ALL
-SELECT 
-  'TARGET' AS grant_source,
-  COUNT(*) AS grant_count
-FROM target_grants;
 
--- ===================================================================
--- 4. Cleanup
--- ===================================================================
-USE ROLE USERADMIN;
-DROP USER IF EXISTS priv_copy_test_user;
-DROP ROLE IF EXISTS priv_copy_test_role;
+SELECT 
+  'CLONED' AS SCHEMA_TYPE,
+  PRIVILEGE,
+  GRANTEE_TYPE,
+  GRANTEE_NAME,
+  GRANT_OPTION
+FROM TABLE(
+  INFORMATION_SCHEMA.OBJECT_PRIVILEGES(
+    OBJECT_TYPE => 'SCHEMA',
+    OBJECT_NAME => 'CLONED_SCHEMA',
+    DATABASE_NAME => 'PRIV_TEST_DB'
+  )
+)
+ORDER BY 1, 2, 3;
+
+-- =============================================
+-- 4. CLEANUP (RUN WHEN DONE)
+-- =============================================
+USE ROLE SECURITYADMIN;
+DROP USER TEST_USER;
+DROP ROLE TEST_DATA_OWNER;
+DROP ROLE TEST_DATA_READER;
 
 USE ROLE SYSADMIN;
-DROP DATABASE IF EXISTS priv_copy_db;
+DROP DATABASE PRIV_TEST_DB;
+DROP PROCEDURE COPY_SCHEMA_PRIVILEGES(STRING, STRING);
