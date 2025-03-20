@@ -1,0 +1,127 @@
+-- =============================================
+-- STEP 1: Setup Test Environment
+-- =============================================
+USE ROLE ACCOUNTADMIN;
+
+-- Create test database
+CREATE OR REPLACE DATABASE PRIVILEGE_COPY_TEST;
+USE DATABASE PRIVILEGE_COPY_TEST;
+
+-- Create test roles
+CREATE OR REPLACE ROLE TEST_ROLE_1;
+CREATE OR REPLACE ROLE TEST_ROLE_2;
+GRANT ROLE TEST_ROLE_1 TO ROLE ACCOUNTADMIN;
+GRANT ROLE TEST_ROLE_2 TO ROLE ACCOUNTADMIN;
+
+-- Create source schema with privileges
+CREATE SCHEMA TEST_SRC;
+GRANT USAGE ON SCHEMA TEST_SRC TO ROLE TEST_ROLE_1;
+GRANT MONITOR ON SCHEMA TEST_SRC TO ROLE TEST_ROLE_2;
+
+-- Add future grants
+GRANT SELECT ON FUTURE TABLES IN SCHEMA TEST_SRC TO ROLE TEST_ROLE_1;
+GRANT INSERT ON FUTURE TABLES IN SCHEMA TEST_SRC TO ROLE TEST_ROLE_2;
+
+-- Create test table (to verify future grants)
+CREATE TABLE TEST_SRC.MY_TABLE (id NUMBER);
+
+-- =============================================
+-- STEP 2: Create Stored Procedure
+-- =============================================
+CREATE OR REPLACE PROCEDURE COPY_SCHEMA_PRIVILEGES(
+  SRC_SCHEMA STRING, 
+  DST_SCHEMA STRING
+)
+RETURNS STRING
+LANGUAGE JAVASCRIPT
+EXECUTE AS CALLER
+AS
+$$
+  try {
+    // Copy existing grants
+    var query = `SHOW GRANTS ON SCHEMA ${SRC_SCHEMA}`;
+    var stmt = snowflake.createStatement({sqlText: query});
+    var rs = stmt.execute();
+    var queryId = stmt.getQueryId();
+
+    snowflake.execute({
+      sqlText: `
+        CREATE TEMPORARY TABLE TEMP_GRANTS AS
+        SELECT CONCAT(
+          'GRANT ', "privilege", ' ON ', "granted_on", ' ${DST_SCHEMA} ',
+          ' TO ROLE ', "grantee_name", ';'
+        ) AS GRANT_CMD
+        FROM TABLE(RESULT_SCAN('${queryId}'))
+        WHERE "privilege" != 'OWNERSHIP';`
+    });
+
+    // Copy future grants
+    query = `SHOW FUTURE GRANTS IN SCHEMA ${SRC_SCHEMA}`;
+    stmt = snowflake.createStatement({sqlText: query});
+    rs = stmt.execute();
+    queryId = stmt.getQueryId();
+
+    snowflake.execute({
+      sqlText: `
+        INSERT INTO TEMP_GRANTS
+        SELECT CONCAT(
+          'GRANT ', "privilege", ' ON FUTURE ', "grant_on", 'S IN SCHEMA ${DST_SCHEMA} ',
+          ' TO ROLE ', "grantee_name", ';'
+        ) AS GRANT_CMD
+        FROM TABLE(RESULT_SCAN('${queryId}'))`
+    });
+
+    // Execute all grants
+    var grants = snowflake.createStatement({
+      sqlText: "SELECT GRANT_CMD FROM TEMP_GRANTS"
+    }).execute();
+    
+    while (grants.next()) {
+      snowflake.execute({sqlText: grants.getColumnValue(1)});
+    }
+
+    return 'Success: All privileges copied!\n' +
+           'Source: ' + SRC_SCHEMA + '\n' +
+           'Destination: ' + DST_SCHEMA;
+           
+  } catch (err) {
+    return "Error: " + err.message;
+  }
+$$;
+
+
+-- =============================================
+-- STEP 3: Test the Procedure
+-- =============================================
+-- Rename original schema
+ALTER SCHEMA TEST_SRC RENAME TO BACKUP_SCHEMA;
+
+-- Create cloned schema
+CREATE SCHEMA TEST_SRC CLONE BACKUP_SCHEMA;
+
+-- Verify no existing privileges on clone
+SHOW GRANTS ON SCHEMA TEST_SRC;          -- Should be empty
+SHOW FUTURE GRANTS IN SCHEMA TEST_SRC;   -- Should be empty
+
+-- Run copy procedure
+CALL COPY_SCHEMA_PRIVILEGES('BACKUP_SCHEMA', 'TEST_SRC');
+
+-- Verify copied privileges
+SHOW GRANTS ON SCHEMA TEST_SRC;          -- Should match original
+SHOW FUTURE GRANTS IN SCHEMA TEST_SRC;   -- Should match original
+
+-- Verify future grants work
+CREATE TABLE TEST_SRC.NEW_TABLE (id NUMBER);
+SHOW GRANTS ON TABLE TEST_SRC.NEW_TABLE; -- Should have SELECT/INSERT grants
+
+-- =============================================
+-- STEP 4: Cleanup
+-- =============================================
+USE ROLE ACCOUNTADMIN;
+
+-- Drop test database
+DROP DATABASE PRIVILEGE_COPY_TEST;
+
+-- Drop roles
+DROP ROLE TEST_ROLE_1;
+DROP ROLE TEST_ROLE_2;
